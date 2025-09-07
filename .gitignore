@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pkl
+*.sqlite3
+*.log
+
+# Virtual env
+.venv/
+venv/
+ENV/
+env/
+
+# IDE / OS
+.idea/
+.vscode/
+*.iml
+.DS_Store
+
+# Reports / temp files
+*.pdf
+*.csv
+*.xlsx
+*.tmp
+
+# Local data / cache
+.cache/
+.streamlit/
+
+# Environment variables
+.env
