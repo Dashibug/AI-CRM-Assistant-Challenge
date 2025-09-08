@@ -13,7 +13,8 @@ PRICE_PATTERNS = [r"\bдорого\b", r"\bбюджет(а|у)?\s*нет\b"]
 CHOOSE_OTHER_PATTERNS = [r"\bвыбрали\s+другого\b", r"\bостановилис[ья]\s+на\b"]
 REFUSAL_PATTERNS = [r"\bоткаж\w*\b", r"\bнеинтересно\b"]
 
-def semantic_triggers(text:str) -> list[str]:
+
+def semantic_triggers(text: str) -> list[str]:
     t = (text or "").lower()
 
     def any_match(pats):
@@ -29,9 +30,11 @@ def semantic_triggers(text:str) -> list[str]:
 
 _CACHE: dict[str, dict] = {}
 
+
 def _hash_features(feats: Dict[str, Any]) -> str:
     s = json.dumps(feats, ensure_ascii=False, sort_keys=True)
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
 
 def _extract_json_block(text: str) -> dict:
     """
@@ -41,6 +44,7 @@ def _extract_json_block(text: str) -> dict:
     if not m:
         raise ValueError("No JSON object found in LLM response")
     return json.loads(m.group(0))
+
 
 class LLMClient:
     def __init__(self,
@@ -70,7 +74,7 @@ class LLMClient:
                 if attempt == self.max_retries:
                     raise
                 time.sleep(min(2 ** attempt, 4))
-        raise last_err  # на всякий случай
+        raise last_err
 
     def classify_tone(self, text: str) -> str:
         """
@@ -92,8 +96,6 @@ positive | neutral | negative
     def assess_risk_llm(self, features: Dict[str, Any]) -> dict:
         """
         LLM-only оценка риска.
-        модель НЕ может ссылаться на "задержку" или "старение",
-        если соответствующие триггеры не активны. - чтоб галлюнов не было
         Вход features:
           {
             "deal_id": str,
@@ -115,54 +117,51 @@ positive | neutral | negative
         lcd = int(features.get("last_contact_days", 0) or 0)
         sad = int(features.get("stage_age_days", 0) or 0)
 
-        active_triggers = []
-        if lcd > 14:
-            active_triggers.append("no_reply_high")
-        elif lcd > 7:
-            active_triggers.append("no_reply_medium")
-
-        if sad > 14:
-            active_triggers.append("stage_age_high")
-        elif sad > 7:
-            active_triggers.append("stage_age_medium")
-
-        guarded_feats = dict(features)
-        guarded_feats["active_triggers"] = active_triggers
-
         sem_triggers = semantic_triggers(features.get("last_message_text", ""))
+
         guarded_feats = dict(features)
-        guarded_feats["active_triggers"] = active_triggers
         guarded_feats["semantic_triggers"] = sem_triggers
 
         key = _hash_features(guarded_feats)
         if key in _CACHE:
             return _CACHE[key]
 
-        # строгая инструкция для минимизации галлюцинаций
         prompt = f"""
-Ты ассистент руководителя продаж. Оцени РИСК по сделке и предложи короткое действие менеджеру.
-ОПИРАЙСЯ ТОЛЬКО на переданные признаки и список active_triggers. НЕ придумывай факторы.
+Ты ассистент руководителя продаж. Оцени РИСК по сделке и предложи КОРОТКОЕ действие менеджеру.
+ОПИРАЙСЯ ТОЛЬКО на переданные признаки. НЕ придумывай факторы.
 
-Правила оценки (для консистентности):
-- last_contact_days > 14 → высокий риск; 7–14 → средний.
-- stage_age_days значительно выше типичных (если >14 — высокий, 7–14 — средний) → повышай риск.
-- Негатив/отказ/«дорого», «выбрали другого», «откажемся», «неинтересно», «приостановим», «позже» → повышай риск.
-- Позитивные сигналы («жду предложение», «финализировать») → слегка снижают.
-- Большая сумма усиливает уже обнаруженный риск (но сама по себе не делает red).
-- semantic_triggers может содержать: "postpone", "price_objection", "chose_other", "refusal".
-  * "postpone" (перенос/«через неделю», «позже») => уровень НЕ может быть green (минимум yellow).
-  * "price_objection" или "chose_other" или "refusal" => повышай риск.
-- Итоговый score верни от 0 до 2 с шагом 0.1 примерно: 0..0.89=green, 0.9..1.99=yellow, >=2.0=red.
+Уровень риска определяется по строгим ПРИОРИТЕТНЫМ правилам:
+1.  **КРАСНЫЙ (RED) - ВЫСОКИЙ РИСК:**
+    - last_contact_days > 21.
+    - Один из триггеров: "refusal", "chose_other", "price_objection" (очень негативный).
+    - Причина - отказ или выбор другого поставщика.
+2.  **ЖЕЛТЫЙ (YELLOW) - СРЕДНИЙ РИСК:**
+    - last_contact_days от 7 до 21.
+    - Триггер "postpone" (перенос) или другие слова, указывающие на задержку.
+    - Возраст сделки (stage_age_days) > 14 дней.
+    - Последнее сообщение клиента содержит негативную тональность.
+3.  **ЗЕЛЕНЫЙ (GREEN) - НИЗКИЙ РИСК:**
+    - last_contact_days < 7.
+    - Нет негативных или отказных триггеров.
+    - Нет проблем с возрастом сделки.
 
-Верни СТРОГО JSON без лишнего текста:
+Верни СТРОГО JSON без лишнего текста. Объяснение и действие должны быть на русском языке.
+
 {{
-  "score": <float 0..2>,
   "level": "green"|"yellow"|"red",
-  "reason": "<кратко по-русски, 1–2 причины>",
-  "action": "<следующий шаг менеджера, 1 короткое предложение>"
+  "reason": "<краткая причина, 1-2 предложения>",
+  "action": "<следующий шаг, 1 предложение>"
 }}
 
-Признаки:
+ПРИМЕР 1 (ПОЛОЖИТЕЛЬНЫЙ):
+Вход: {{"last_contact_days": 1, "stage_age_days": 2, "semantic_triggers": []}}
+Выход: {{"level": "green", "reason": "Нет обнаруженных рисков.", "action": "Продолжать общение по плану."}}
+
+ПРИМЕР 2 (НЕГАТИВНЫЙ):
+Вход: {{"last_contact_days": 1, "stage_age_days": 2, "semantic_triggers": ["price_objection", "chose_other"]}}
+Выход: {{"level": "red", "reason": "Клиент сообщил о высокой цене и выбрал конкурента.", "action": "Выяснить причины отказа и попытаться переубедить."}}
+
+Оцени следующие признаки:
 {json.dumps(guarded_feats, ensure_ascii=False)}
 """
         payload = {"model": self.model, "messages": [{"role": "user", "content": prompt}]}
@@ -172,7 +171,7 @@ positive | neutral | negative
         try:
             obj = _extract_json_block(raw)
             level = str(obj.get("level", "yellow")).lower()
-            if level not in {"green","yellow","red"}:
+            if level not in {"green", "yellow", "red"}:
                 level = "yellow"
             score = float(obj.get("score", 1.0))
             if score < 0: score = 0.0
@@ -188,10 +187,11 @@ positive | neutral | negative
                     reason = (reason + "; перенос обсуждения").strip("; ").strip()
                 if not action or action.lower().startswith("свяж"):
                     action = "Запланируйте слот на следующей неделе и закрепите повестку письмом."
-            out = {"score": round(score,2), "level": level, "reason": reason, "action": action}
+            out = {"score": round(score, 2), "level": level, "reason": reason, "action": action}
         except Exception:
             # безопасный фоллбэк
-            out = {"score": 1.0, "level": "yellow", "reason": "fallback: не удалось распарсить ответ", "action": "Связаться с клиентом"}
+            out = {"score": 1.0, "level": "yellow", "reason": "fallback: не удалось распарсить ответ",
+                   "action": "Связаться с клиентом"}
 
         _CACHE[key] = out
         return out

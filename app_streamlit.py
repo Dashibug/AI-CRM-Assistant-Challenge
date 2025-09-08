@@ -1,25 +1,74 @@
 # src/app_streamlit.py
 
 import os
-import streamlit as st
-import pandas as pd
-from datetime import datetime
+import json
 import base64
 from io import BytesIO
+from datetime import datetime
+
+import pandas as pd
+import streamlit as st
+
 from reportlab.pdfbase import pdfmetrics
 from reportlab.lib.fonts import addMapping
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.rl_config import TTFSearchPath
-from src.data_loader import fetch_leads, normalize_to_df, create_task
-from src.llm_client import LLMClient
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import mm
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 
+from src.data_loader import fetch_leads, normalize_to_df, create_task
+from src.llm_client import LLMClient
 
-BASE = os.getenv("KOMMO_BASE_URL", "").rstrip("/")
+
+# ---------- helpers ----------
+def get_kommo_creds():
+    base = (st.session_state.get("kommo_base") or os.getenv("KOMMO_BASE_URL", "")).rstrip("/")
+    token = st.session_state.get("kommo_token") or os.getenv("KOMMO_ACCESS_TOKEN", "")
+    return base, token
+
+def _coerce_leads(raw):
+    """Приводим ответ fetch_leads к списку словарей [{...}, ...]. Терпимо к разным форматам."""
+    if raw is None:
+        return []
+    # если пришла JSON-строка
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except Exception:
+            # не парсится — оставим пусто, чтобы не падать
+            return []
+    # если пришёл dict от Kommo с _embedded
+    if isinstance(raw, dict):
+        if "_embedded" in raw and isinstance(raw["_embedded"], dict):
+            # Kommo обычно кладёт в _embedded['leads']
+            for key in ("leads", "items", "data"):
+                if key in raw["_embedded"] and isinstance(raw["_embedded"][key], list):
+                    return raw["_embedded"][key]
+        # иногда просто {"leads": [...]}
+        if "leads" in raw and isinstance(raw["leads"], list):
+            return raw["leads"]
+        # а вдруг это уже одна сделка-словарь
+        if "id" in raw:
+            return [raw]
+        return []
+    # если это уже список — убедимся, что там словари
+    if isinstance(raw, list):
+        # бывают списки json-строк — попробуем распарсить элементы
+        if raw and isinstance(raw[0], str):
+            out = []
+            for x in raw:
+                try:
+                    out.append(json.loads(x))
+                except Exception:
+                    pass
+            return out
+        return raw
+    # дефолтно — пусто
+    return []
+
 
 # ---------------- Kommo-like styles ----------------
 KOMMO_CSS = """
@@ -38,8 +87,6 @@ KOMMO_CSS = """
   --radius: 18px;
 }
 section.main > div {background: var(--kommo-bg) !important;}
-
-/* header */
 .kommo-header {
   background: linear-gradient(135deg, var(--kommo-primary), var(--kommo-primary-2));
   color: white; border-radius: 20px; padding: 22px 24px; margin-bottom: 14px;
@@ -47,32 +94,21 @@ section.main > div {background: var(--kommo-bg) !important;}
 }
 .kommo-title {font-size: 22px; font-weight: 700; margin: 0 0 6px 0;}
 .kommo-subtitle {opacity: 0.9; font-size: 14px; margin: 0;}
-
-/* СТИЛЬ ДЛЯ streamlit-КНОПКИ (глобально) */
 .stButton > button {
-  background: #ffffff;
-  color: #3a2fff;
-  border: 1px solid rgba(255,255,255,0.6);
-  padding: 10px 16px;
-  border-radius: 12px;
-  font-weight: 800;
-  box-shadow: 0 8px 22px rgba(31,31,46,0.08);
+  background: #ffffff; color: #3a2fff; border: 1px solid rgba(255,255,255,0.6);
+  padding: 10px 16px; border-radius: 12px; font-weight: 800; box-shadow: 0 8px 22px rgba(31,31,46,0.08);
 }
 .stButton > button:hover { background: #f7f6ff; }
-
-/* не трогаем кнопку скачивания */
 .stDownloadButton > button {
-  background: #fff; color: var(--kommo-text);
-  border: 1px solid var(--kommo-border); border-radius: 12px;
+  background: #fff; color: var(--kommo-text); border: 1px solid var(--kommo-border); border-radius: 12px;
 }
-
-/* KPI и карточки */
 .kpi-row {display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; margin: 10px 0 18px;}
-.kpi-card {background: var(--kommo-card); border: 1px solid var(--kommo-border); border-radius: var(--radius); padding: 14px 16px; box-shadow: 0 6px 18px rgba(31,31,46,0.04);}
+.kpi-card {background: var(--kommo-card); border: 1px solid var(--kommo-border); border-radius: var(--radius);
+  padding: 14px 16px; box-shadow: 0 6px 18px rgba(31,31,46,0.04);}
 .kpi-label {color: var(--kommo-muted); font-size: 12px; margin-bottom: 6px;}
 .kpi-value {color: var(--kommo-text); font-size: 22px; font-weight: 800;}
-
-.lead-card {background: var(--kommo-card); border: 1px solid var(--kommo-border); border-radius: var(--radius); padding: 14px 16px; margin-bottom: 10px; box-shadow: 0 8px 22px rgba(31,31,46,0.05);}
+.lead-card {background: var(--kommo-card); border: 1px solid var(--kommo-border); border-radius: var(--radius);
+  padding: 14px 16px; margin-bottom: 10px; box-shadow: 0 8px 22px rgba(31,31,46,0.05);}
 .lead-head {display:flex; align-items:center; justify-content:space-between; margin-bottom:8px;}
 .lead-name {font-weight: 750; font-size: 16px; color: var(--kommo-text);}
 .lead-sec {color: var(--kommo-muted); font-size: 12px;}
@@ -100,6 +136,11 @@ st.markdown(
     unsafe_allow_html=True
 )
 
+# --------- LLM client (глобально, один раз) ----------
+if "llm_client" not in st.session_state:
+    st.session_state["llm_client"] = LLMClient()
+client = st.session_state["llm_client"]
+
 # --- Controls / globals ---
 refresh_clicked = st.button("Посмотреть риски", key="refresh_btn")
 SLA_DAYS = int(os.getenv("SLA_DAYS", "2"))
@@ -116,7 +157,6 @@ def _deadline_today_18() -> int:
 ROOT = os.path.dirname(__file__)
 FONTS_DIR = os.path.join(ROOT, "src", "fonts")
 TTFSearchPath.append(FONTS_DIR)
-
 FONT_REGULAR = os.path.join(FONTS_DIR, "DejaVuSans.ttf")
 FONT_BOLD    = os.path.join(FONTS_DIR, "DejaVuSans-Bold.ttf")
 
@@ -134,7 +174,6 @@ else:
             pdfmetrics.registerFont(TTFont("DejaVu-Bold", FONT_REGULAR))
             pdfmetrics.registerFont(TTFont("DejaVu-Italic", FONT_REGULAR))
             pdfmetrics.registerFont(TTFont("DejaVu-BoldItalic", FONT_REGULAR))
-
         addMapping('DejaVu', 0, 0, 'DejaVu')
         addMapping('DejaVu', 0, 1, 'DejaVu-Italic')
         addMapping('DejaVu', 1, 0, 'DejaVu-Bold')
@@ -144,20 +183,17 @@ else:
         st.error(f"Ошибка регистрации шрифта: {e}")
 
 def get_pdf_download_link(pdf_bytes: bytes, filename: str, link_text: str = "Скачать отчёт (PDF)") -> str:
-    """
-    Возвращает HTML <a> с data:application/pdf;base64,....
-    """
     b64 = base64.b64encode(pdf_bytes).decode("utf-8")
-    href = f'<a href="data:application/pdf;base64,{b64}" download="{filename}" ' \
-           f'style="display:inline-block;padding:10px 14px;border-radius:10px;' \
-           f'background:#6a5cff;color:#fff;font-weight:700;text-decoration:none;">{link_text}</a>'
-    return href
+    return (
+        f'<a href="data:application/pdf;base64,{b64}" download="{filename}" '
+        f'style="display:inline-block;padding:10px 14px;border-radius:10px;'
+        f'background:#6a5cff;color:#fff;font-weight:700;text-decoration:none;">{link_text}</a>'
+    )
 
 def _digest_pdf(df: pd.DataFrame) -> bytes:
     buffer = BytesIO()
     doc = SimpleDocTemplate(
-        buffer,
-        pagesize=A4,
+        buffer, pagesize=A4,
         leftMargin=18*mm, rightMargin=18*mm, topMargin=16*mm, bottomMargin=16*mm,
         title="Отчёт по рискам сделок"
     )
@@ -166,21 +202,17 @@ def _digest_pdf(df: pd.DataFrame) -> bytes:
     base_font = 'DejaVu' if USING_DEJAVU else styles['Normal'].fontName
     bold_font = 'DejaVu-Bold' if USING_DEJAVU else styles['Heading1'].fontName
 
-    # стили
     styles.add(ParagraphStyle(name="H1", fontName=bold_font, fontSize=18, leading=22, spaceAfter=8))
     styles.add(ParagraphStyle(name="H2", fontName=bold_font, fontSize=13, leading=17, spaceBefore=8, spaceAfter=6))
     styles.add(ParagraphStyle(name="P",  fontName=base_font, fontSize=10.5, leading=14))
     styles.add(ParagraphStyle(name="Small", fontName=base_font, fontSize=9, leading=12, textColor=colors.grey))
-    styles.add(ParagraphStyle(name="Wrap", fontName=base_font, fontSize=9.5, leading=12.5, wordWrap='CJK'))  # переносы
+    styles.add(ParagraphStyle(name="Wrap", fontName=base_font, fontSize=9.5, leading=12.5, wordWrap='CJK'))
 
-    def P(text, style="P"):
-        return Paragraph(text, styles[style])
+    def P(text, style="P"): return Paragraph(text, styles[style])
 
     def _fmt_money(x):
-        try:
-            return f"{int(x):,}".replace(",", " ")
-        except Exception:
-            return str(x)
+        try: return f"{int(x):,}".replace(",", " ")
+        except Exception: return str(x)
 
     red = df[df["risk_level"] == "red"]
     yellow = df[df["risk_level"] == "yellow"]
@@ -191,7 +223,6 @@ def _digest_pdf(df: pd.DataFrame) -> bytes:
     elems.append(P(f"Сформировано: <b>{datetime.now().strftime('%d.%m.%Y %H:%M')}</b>", "Small"))
     elems.append(Spacer(1, 6))
 
-    # KPI
     kpi_data = [
         [P("<b>Красные</b>", "Small"), P("<b>Сумма сделок в красной зоне, ₽</b>", "Small"), P("<b>Жёлтые</b>", "Small")],
         [P(str(len(red))), P(_fmt_money(total_red)), P(str(len(yellow)))]
@@ -219,19 +250,10 @@ def _digest_pdf(df: pd.DataFrame) -> bytes:
     if top_red.empty:
         elems.append(P("Нет критичных сделок", "P"))
     else:
-        # фиксированные колонки
-        w_id = 18*mm
-        w_lead = 35*mm
-        w_sum = 22*mm
-        w_last = 28*mm
-        w_lvl = 16*mm
-        w_link = 14*mm
-
+        w_id, w_lead, w_sum, w_last, w_lvl, w_link = 18*mm, 35*mm, 22*mm, 28*mm, 16*mm, 14*mm
         fixed = w_id + w_lead + w_sum + w_last + w_lvl + w_link
-        avail = doc.width
-        rest = max(20*mm, avail - fixed)  # остаток под Причину+Действие
-        w_reason = rest * 0.55
-        w_action = rest * 0.45
+        rest = max(20*mm, doc.width - fixed)
+        w_reason, w_action = rest * 0.55, rest * 0.45
 
         header = [P("<b>ID</b>"), P("<b>Лид</b>"), P("<b>Сумма, ₽</b>"), P("<b>Последний контакт</b>"),
                   P("<b>Уровень</b>"), P("<b>Причина</b>"), P("<b>Действие</b>"), P("<b>Kommo</b>")]
@@ -251,8 +273,7 @@ def _digest_pdf(df: pd.DataFrame) -> bytes:
                 (Paragraph(f'<a href="{link}">{link_txt}</a>', styles["P"]) if link else P("—"))
             ])
 
-        col_widths = [w_id, w_lead, w_sum, w_last, w_lvl, w_reason, w_action, w_link]
-        t = Table(rows, colWidths=col_widths, repeatRows=1)
+        t = Table(rows, colWidths=[w_id, w_lead, w_sum, w_last, w_lvl, w_reason, w_action, w_link], repeatRows=1)
         t.setStyle(TableStyle([
             ('FONTNAME', (0,0), (-1,-1), base_font),
             ('FONTSIZE', (0,0), (-1,-1), 9),
@@ -273,14 +294,10 @@ def _digest_pdf(df: pd.DataFrame) -> bytes:
         elems.append(Spacer(1, 10))
         elems.append(P("Жёлтые сделки (топ-10 по сумме)", "H2"))
 
-        w_id = 18*mm
-        w_lead = 35*mm
-        w_sum = 22*mm
-        w_last = 28*mm
+        w_id, w_lead, w_sum, w_last = 18*mm, 35*mm, 22*mm, 28*mm
         fixed = w_id + w_lead + w_sum + w_last
         rest = max(20*mm, doc.width - fixed)
-        w_reason = rest * 0.50
-        w_action = rest * 0.50
+        w_reason, w_action = rest * 0.50, rest * 0.50
 
         header = [P("<b>ID</b>"), P("<b>Лид</b>"), P("<b>Сумма, ₽</b>"), P("<b>Последний контакт</b>"),
                   P("<b>Причина</b>"), P("<b>Действие</b>")]
@@ -297,8 +314,7 @@ def _digest_pdf(df: pd.DataFrame) -> bytes:
                 Paragraph(str(r.get("action","—")), styles["Wrap"])
             ])
 
-        col_widths = [w_id, w_lead, w_sum, w_last, w_reason, w_action]
-        yt = Table(rows, colWidths=col_widths, repeatRows=1)
+        yt = Table(rows, colWidths=[w_id, w_lead, w_sum, w_last, w_reason, w_action], repeatRows=1)
         yt.setStyle(TableStyle([
             ('FONTNAME', (0,0), (-1,-1), base_font),
             ('FONTSIZE', (0,0), (-1,-1), 9),
@@ -315,7 +331,7 @@ def _digest_pdf(df: pd.DataFrame) -> bytes:
         elems.append(yt)
 
     elems.append(Spacer(1, 8))
-    elems.append(P("Примечание: уровень риска и действия рассчитаны LLM на основе последних коммуникаций и метрик активности."
+    elems.append(P("Примечание: уровень риска и действия рассчитаны LLM на основе последних коммуникаций и метрик активности. "
                    "Ссылки работают в PDF-ридерах с поддержкой переходов.", "Small"))
 
     doc.build(elems)
@@ -323,13 +339,13 @@ def _digest_pdf(df: pd.DataFrame) -> bytes:
     buffer.close()
     return pdf
 
-def kommo_url(deal_id: str) -> str:
-    return f"{BASE}/leads/detail/{deal_id}" if BASE and str(deal_id).strip() else ""
+
+def kommo_url(base_url: str, deal_id: str) -> str:
+    return f"{base_url.rstrip('/')}/leads/detail/{deal_id}" if base_url and str(deal_id).strip() else ""
+
 
 def _days_since_any(s: str | None) -> int:
-    """Для last_contact_days: если даты нет — трактуем как 'очень давно'."""
-    if not s:
-        return 9999
+    if not s: return 9999
     try:
         dt = pd.to_datetime(s, utc=False, errors="coerce")
         if pd.isna(dt): return 9999
@@ -338,9 +354,7 @@ def _days_since_any(s: str | None) -> int:
         return 9999
 
 def _stage_age_days(s: str | None) -> int:
-    """Для возраста стадии: если даты нет — НЕ штрафуем (0)."""
-    if not s:
-        return 0
+    if not s: return 0
     try:
         dt = pd.to_datetime(s, utc=False, errors="coerce")
         if pd.isna(dt): return 0
@@ -348,61 +362,83 @@ def _stage_age_days(s: str | None) -> int:
     except Exception:
         return 0
 
+
 # ---------------- Main flow ----------------
-# 1) При клике «Обновить» — загрузка и скоринг, кладём в session_state
 if refresh_clicked:
-    with st.spinner("Загружаем сделки из Kommo..."):
-        leads = fetch_leads(limit=200)
-        df = normalize_to_df(leads, fetch_notes=True)
-
-    if df is None or df.empty:
-        st.warning("Нет данных.")
+    BASE, TOKEN = get_kommo_creds()
+    if not BASE or not TOKEN:
+        st.warning("Сначала подключите Kommo в сайдбаре.")
     else:
-        client = LLMClient()
-        scores, levels, reasons, actions = [], [], [], []
+        with st.spinner("Загружаем сделки из Kommo..."):
+            # обязательно передаём креды
+            raw_leads = fetch_leads(BASE, TOKEN, limit=200)
+            leads = _coerce_leads(raw_leads)
 
-        with st.spinner("Оцениваем риски LLM..."):
-            for _, row in df.iterrows():
-                feats = {
-                    "deal_id": str(row.get("deal_id", "")),
-                    "client_name": str(row.get("client_name", "")),
-                    "stage": str(row.get("stage", "")),
-                    "last_contact_days": _days_since_any(row.get("last_contact_date")),
-                    "stage_age_days": _stage_age_days(row.get("last_stage_change_date")),
-                    "deal_value": float(row.get("deal_value", 0) or 0),
-                    "last_message_text": str(row.get("last_message_text", "")),
-                }
-                res = client.assess_risk_llm(feats)
-                scores.append(res["score"])
-                levels.append(res["level"])
-                reasons.append(res["reason"])
-                actions.append(res["action"])
+            # нормализация с подхватом заметок из нужного аккаунта
+            df = normalize_to_df(leads, fetch_notes=True, base_url=BASE, token=TOKEN)
 
-        df_out = df.copy()
-        df_out["risk_score"]  = scores
-        df_out["risk_level"]  = levels
-        df_out["risk_reason"] = reasons
-        df_out["action"]      = actions
-        df_out["kommo"]       = df_out["deal_id"].apply(kommo_url)
-        df_out["last_contact_days"] = df_out["last_contact_date"].apply(_days_since_any)
+        if df is None or df.empty:
+            st.warning("Нет данных.")
+        else:
+            scores, levels, reasons, actions = [], [], [], []
 
-        st.session_state["df_out"] = df_out
-        st.session_state.setdefault("drafts", {})
-        st.session_state["data_ready"] = True
+            with st.spinner("Оцениваем риски LLM..."):
+                for _, row in df.iterrows():
+                    feats = {
+                        "deal_id": str(row.get("deal_id", "")),
+                        "client_name": str(row.get("client_name", "")),
+                        "stage": str(row.get("stage", "")),
+                        "last_contact_days": _days_since_any(row.get("last_contact_date")),
+                        "stage_age_days": _stage_age_days(row.get("last_stage_change_date")),
+                        "deal_value": float(row.get("deal_value", 0) or 0),
+                        "last_message_text": str(row.get("last_message_text", "")),
+                    }
+                    res = client.assess_risk_llm(feats)
+                    scores.append(res["score"]); levels.append(res["level"])
+                    reasons.append(res["reason"]); actions.append(res["action"])
 
-        # сформируем PDF и положим в session_state (чтобы не считать заново на каждом ререндере)
+            df_out = df.copy()
+            df_out["risk_score"]  = scores
+            df_out["risk_level"]  = levels
+            df_out["risk_reason"] = reasons
+            df_out["action"]      = actions
+            df_out["kommo"]       = df_out["deal_id"].apply(lambda x: kommo_url(BASE, x))
+            df_out["last_contact_days"] = df_out["last_contact_date"].apply(_days_since_any)
+
+            st.session_state["df_out"] = df_out
+            st.session_state.setdefault("drafts", {})
+            st.session_state["data_ready"] = True
+
+            try:
+                st.session_state["risk_pdf"] = _digest_pdf(df_out)
+            except Exception as e:
+                st.session_state["risk_pdf"] = None
+                st.warning(f"Не удалось собрать PDF: {e}")
+
+
+# ---- Sidebar: подключение к Kommo ----
+with st.sidebar:
+    st.subheader("Подключение к Kommo")
+    base_input = st.text_input("Базовый домен", st.session_state.get("kommo_base") or "https://your.kommo.com")
+    token_input = st.text_input("Access token", type="password", value=st.session_state.get("kommo_token") or "")
+    if st.button("Подключить"):
         try:
-            st.session_state["risk_pdf"] = _digest_pdf(df_out)
+            _ = _coerce_leads(fetch_leads(base_input.rstrip("/"), token_input, limit=1))
+            st.session_state["kommo_base"] = base_input.rstrip("/")
+            st.session_state["kommo_token"] = token_input
+            # очистим прежнее состояние
+            for k in ("df_out", "risk_pdf", "data_ready"):
+                st.session_state.pop(k, None)
+            st.success("Подключено ✅ Нажмите «Посмотреть риски».")
         except Exception as e:
-            st.session_state["risk_pdf"] = None
-            st.warning(f"Не удалось собрать PDF: {e}")
+            st.error(f"Не удалось подключиться: {e}")
 
-# 2) Рендерим UI из session_state
+
+# ---- UI из session_state ----
 df_out = st.session_state.get("df_out")
 if not st.session_state.get("data_ready") or df_out is None or df_out.empty:
-    st.info("Нажмите «Обновить риски», чтобы подтянуть сделки и оценить их LLM-ом.")
+    st.info("Нажмите «Посмотреть риски», чтобы подтянуть сделки и оценить их LLM-ом.")
 else:
-    # KPI
     red = df_out[df_out["risk_level"] == "red"]
     yellow = df_out[df_out["risk_level"] == "yellow"]
     kpi_html = f"""
@@ -423,7 +459,6 @@ else:
     """
     st.markdown(kpi_html, unsafe_allow_html=True)
 
-    # Фильтры
     st.subheader("Фильтры")
     c1, c2 = st.columns(2)
     with c1:
@@ -431,7 +466,6 @@ else:
     with c2:
         top_by_value = st.checkbox("Топ-10 по сумме", value=False, key="flt_top_value")
 
-    # Приоритизация (score скрыт в UI)
     order = {"red": 0, "yellow": 1, "green": 2}
     view = (df_out.copy()
             .assign(_ord=df_out["risk_level"].map(order))
@@ -442,9 +476,8 @@ else:
     if top_by_value and "deal_value" in view.columns:
         view = view.sort_values("deal_value", ascending=False).head(10)
 
-    # Карточки + действия
     st.subheader("Приоритеты")
-    client = LLMClient()  # для генерации писем (не для скоринга)
+
 
     for _, r in view.iterrows():
         level = r["risk_level"]
@@ -478,12 +511,13 @@ else:
         """
         st.markdown(card_html, unsafe_allow_html=True)
 
-        # Кнопки действий
         colA, colB = st.columns(2)
         with colA:
             if st.button("Создать задачу в Kommo", key=f"task_{r['deal_id']}"):
                 try:
+                    BASE, TOKEN = get_kommo_creds()
                     create_task(
+                        BASE, TOKEN,
                         int(r["deal_id"]),
                         _task_text(r),
                         _deadline_today_18(),
@@ -500,9 +534,9 @@ else:
                 st.text_area("Письмо", value=existing, height=150, key=f"txt_{deal_key}")
                 if st.button("Сгенерировать", key=f"draft_{deal_key}"):
                     try:
-                        draft = client.draft_followup(r["client_name"], reason, r.get("last_message_text", ""))
+                        with st.spinner("Генерируем письмо..."):
+                            draft = client.draft_followup(r["client_name"], reason, r.get("last_message_text", ""))
                         st.session_state["drafts"][deal_key] = draft
-                        # мгновенно обновим textarea
                         try:
                             st.rerun()
                         except Exception:
@@ -514,9 +548,7 @@ else:
     st.markdown("---")
     pdf_bytes = st.session_state.get("risk_pdf")
     if pdf_bytes:
-        st.markdown(
-            get_pdf_download_link(pdf_bytes, "risk_report.pdf", "Скачать отчёт (PDF)"),
-            unsafe_allow_html=True
-        )
+        st.markdown(get_pdf_download_link(pdf_bytes, "risk_report.pdf", "Скачать отчёт (PDF)"),
+                    unsafe_allow_html=True)
     else:
         st.info("Отчёт (PDF) недоступен — обнови данные и попробуй снова.")
