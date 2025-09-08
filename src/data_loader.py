@@ -92,7 +92,6 @@ def normalize_to_df(
     base_url = (base_url or os.getenv("KOMMO_BASE_URL", "")).rstrip("/")
     token = token or os.getenv("KOMMO_ACCESS_TOKEN", "")
 
-    # если просили тянуть заметки, а ни колбэка, ни кредов нет — не падаем, просто отключаем
     if fetch_notes and note_fetcher is None and (not base_url or not token):
         fetch_notes = False  # безопасный даунгрейд
 
@@ -124,7 +123,7 @@ def normalize_to_df(
         rows.append({
             "deal_id": str(lead_id),
             "client_name": name,
-            "stage": str(status_id),              # пока ID стадии
+            "stage": str(status_id),              # ID стадии
             "last_contact_date": last_date,       # yyyy-mm-dd
             "last_message_text": last_msg,
             "owner": str(lead.get("responsible_user_id")),

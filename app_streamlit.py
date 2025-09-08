@@ -47,16 +47,13 @@ def _coerce_leads(raw):
             for key in ("leads", "items", "data"):
                 if key in raw["_embedded"] and isinstance(raw["_embedded"][key], list):
                     return raw["_embedded"][key]
-        # иногда просто {"leads": [...]}
         if "leads" in raw and isinstance(raw["leads"], list):
             return raw["leads"]
-        # а вдруг это уже одна сделка-словарь
         if "id" in raw:
             return [raw]
         return []
     # если это уже список — убедимся, что там словари
     if isinstance(raw, list):
-        # бывают списки json-строк — попробуем распарсить элементы
         if raw and isinstance(raw[0], str):
             out = []
             for x in raw:
@@ -66,7 +63,6 @@ def _coerce_leads(raw):
                     pass
             return out
         return raw
-    # дефолтно — пусто
     return []
 
 
