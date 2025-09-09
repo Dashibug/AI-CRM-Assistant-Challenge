@@ -3,7 +3,7 @@
 AI-ассистент для оценки рисков сделок в **Kommo CRM** на основе LLM.  
 Позволяет быстро выявлять проблемные сделки, видеть причины риска и предлагает дальнейшие действия, а также генерирует PDF-отчёт.
 
-<img width="2744" height="1452" alt="image" src="https://github.com/user-attachments/assets/ee7b6453-3c6e-4ab4-8641-43dcc5977b91" />
+<img width="2610" height="1310" alt="image" src="https://github.com/user-attachments/assets/7706f5b8-ef25-463f-9fc8-c1af6e459366" />
 
 
 ---
